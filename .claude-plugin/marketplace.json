@@ -1,0 +1,15 @@
+{
+  "name": "converse2-marketplace",
+  "owner": {
+    "name": "Viktor Varoczi",
+    "email": "vvaroczi@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "converse2",
+      "source": "./",
+      "description": "Conversation mode for Claude Code, v2: Claude talks back with the Pocket TTS voice, streamed on Apple Silicon."
+    }
+  ],
+  "description": "Conversation mode for Claude Code, v2: Claude talks back with a streaming local voice (Pocket TTS)."
+}

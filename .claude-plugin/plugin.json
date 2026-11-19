@@ -1,0 +1,23 @@
+{
+  "name": "converse2",
+  "version": "2.0.0",
+  "description": "Conversation mode for Claude Code, v2: Claude talks back with the Pocket TTS voice, streamed on Apple Silicon so speech starts almost the moment a sentence is written. /converse2 switches it on; replies open with a short spoken part, long detail stays written, any message you send cuts the voice, and you set the voice and pace by talking.",
+  "author": {
+    "name": "Viktor Varoczi",
+    "email": "vvaroczi@gmail.com",
+    "url": "https://github.com/vvaroczi"
+  },
+  "license": "MIT",
+  "keywords": [
+    "voice",
+    "text-to-speech",
+    "pocket-tts",
+    "mlx",
+    "conversation",
+    "accessibility",
+    "macos"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "homepage": "https://github.com/vvaroczi/claude-converse-v2",
+  "repository": "https://github.com/vvaroczi/claude-converse-v2"
+}
