@@ -14,6 +14,12 @@ SOCK = os.path.join(HOME, "voice.sock")
 MODEL_DIR = os.path.join(HOME, "models", "pocket-tts")
 IDLE = int(os.environ.get("CONVERSE_IDLE", "3600"))
 STREAM_INTERVAL = 0.25   # seconds of audio per streamed piece
+BLOCK = 1024             # output block in samples (43 ms at 24 kHz); see Player.open
+STREAM_IDLE = 300        # seconds of silence before the output stream is closed; see Player.close
+FADE = 600               # fade-in at the start of each sentence, in samples (25 ms at 24 kHz); see speak()
+HOLD = 14400             # samples held back at the end of a sentence for trim_tail (600 ms)
+TAIL_GRACE = 2400        # samples kept after the last speech sample before the fade-out (100 ms)
+TAIL_FADE = 960          # fade-out length in samples (40 ms)
 MUTE = bool(os.environ.get("CONVERSE_MUTE"))   # tests: play silence instead of speech
 DEBUG = bool(os.environ.get("CONVERSE_DEBUG"))
 
@@ -70,6 +76,8 @@ class Player:
         self.offset = 0          # samples already played from buf[0]
         self.pending = 0         # samples queued and not yet played
         self.stream = None
+        self.stream_lock = threading.Lock()   # guards open/close only; the callback never takes it
+        self.idle_since = None   # when the last reply ended, while the stream is still open
         self.first = None        # when the first audio of this reply was queued (for the debug log)
 
     def _callback(self, outdata, frames, _time, _status):
@@ -90,10 +98,16 @@ class Player:
 
     def open(self):
         self.first = None
-        # A new stream per reply follows the current default output (headphones plugged in mid-session).
-        self.stream = sd.OutputStream(samplerate=self.sr, channels=1, dtype="float32",
-                                      callback=self._callback, latency="low")
-        self.stream.start()
+        with self.stream_lock:
+            self.idle_since = None
+            if self.stream is not None:
+                return   # still open from the last reply: no start-up pop
+            # Fixed 1024-sample blocks (43 ms): with latency="low" on a 48 kHz device PortAudio pulled this
+            # 24 kHz stream in 15-sample callbacks, 1600 a second, and while MLX generated some arrived late,
+            # which came out of the speakers as crackle. The first sound starts about 40 ms later for it.
+            self.stream = sd.OutputStream(samplerate=self.sr, channels=1, dtype="float32", blocksize=BLOCK,
+                                          callback=self._callback, latency="high")
+            self.stream.start()
 
     def push(self, audio):
         if MUTE:
@@ -115,13 +129,23 @@ class Player:
         return self.pending > 0
 
     def close(self):
-        s, self.stream = self.stream, None
-        if s is not None:
-            try:
-                s.stop()
-                s.close()
-            except Exception:
-                pass
+        # The reply is over, but the stream stays open playing silence: opening and closing a CoreAudio
+        # stream makes the speakers pop, which was heard as a crackle at the start and end of every reply.
+        # idle_close() shuts it after STREAM_IDLE seconds of silence, so a changed default output device
+        # (headphones plugged in) is picked up by the next reply after a pause.
+        with self.stream_lock:
+            self.idle_since = time.time()
+
+    def idle_close(self):
+        with self.stream_lock:
+            if self.stream is None or self.idle_since is None or time.time() - self.idle_since < STREAM_IDLE:
+                return
+            s, self.stream, self.idle_since = self.stream, None, None
+        try:
+            s.stop()
+            s.close()
+        except Exception:
+            pass
 
 
 class Stretcher:
@@ -159,6 +183,22 @@ class Stretcher:
         while not finished:
             _, finished = self.tsm.flush_to(self)
         return self._take()
+
+
+def trim_tail(x, peak):
+    """Cut the decoder's noise tail. After the speech ends Pocket keeps producing 100 to 400 ms of low-level
+    noise (-40 dB, measured 2026-11-20), heard as a hiss between sentences. Everything after the last sample
+    above 4% of the sentence's peak (at least -38 dB), plus a grace period, is faded out over TAIL_FADE."""
+    thr = max(0.012, 0.04 * peak)
+    idx = np.flatnonzero(np.abs(x) > thr)
+    if not len(idx):
+        return x[:0]
+    end = idx[-1] + TAIL_GRACE
+    if end + TAIL_FADE >= len(x):
+        return x
+    x = x[:end + TAIL_FADE].copy()
+    x[end:] *= (0.5 + 0.5 * np.cos(np.linspace(0, np.pi, TAIL_FADE, dtype=np.float32)))
+    return x
 
 
 def sentences(text):
@@ -238,13 +278,34 @@ def speak(model, gen, text, voice, speed):
             if gen != generation:
                 return
             st = Stretcher(speed) if abs(speed - 1.0) >= 0.02 else None
+            onset, peak = True, 0.0
+            held = np.zeros(0, np.float32)   # the last HOLD samples wait, so the tail can be trimmed
             for r in model.generate(sent, voice=voice, stream=True, streaming_interval=STREAM_INTERVAL):
                 if gen != generation:
                     return
                 a = np.array(r.audio, dtype=np.float32).reshape(-1)
-                player.push(st.feed(a) if st else a)   # each piece plays the moment it exists
-            if st and gen == generation:
-                player.push(st.finish())
+                if st:
+                    a = st.feed(a)
+                if not len(a):
+                    continue
+                peak = max(peak, float(np.abs(a).max()))
+                if onset:
+                    # Pocket's decoder starts every sentence at full level within a millisecond, which the
+                    # speakers render as a pop; a short cosine fade-in removes it without touching the speech.
+                    n = min(FADE, len(a))
+                    a[:n] *= (0.5 - 0.5 * np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
+                    onset = False
+                    player.push(a)   # the first piece plays the moment it exists
+                    continue
+                held = np.concatenate([held, a])
+                if len(held) > HOLD:
+                    player.push(held[:-HOLD])
+                    held = held[-HOLD:]
+            if gen != generation:
+                return
+            if st:
+                held = np.concatenate([held, st.finish()])
+            player.push(trim_tail(held, peak))
         while player.busy() and gen == generation:
             time.sleep(0.02)
         time.sleep(0.12)  # let the device play out its last block
@@ -358,6 +419,8 @@ def shutdown():
 def idle_watch():
     while True:
         time.sleep(30)
+        if player and current is None and not pending:
+            player.idle_close()
         if time.time() - last_used > IDLE and current is None and not pending:
             shutdown()
 
