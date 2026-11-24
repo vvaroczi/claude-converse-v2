@@ -15,7 +15,7 @@ MODEL_DIR = os.path.join(HOME, "models", "pocket-tts")
 IDLE = int(os.environ.get("CONVERSE_IDLE", "3600"))
 STREAM_INTERVAL = 0.25   # seconds of audio per streamed piece
 BLOCK = 1024             # output block in samples (43 ms at 24 kHz); see Player.open
-STREAM_IDLE = 300        # seconds of silence before the output stream is closed; see Player.close
+STREAM_IDLE = 45         # seconds of silence before the output stream is closed; see Player.close
 FADE = 600               # fade-in at the start of each sentence, in samples (25 ms at 24 kHz); see speak()
 HOLD = 14400             # samples held back at the end of a sentence for trim_tail (600 ms)
 TAIL_GRACE = 2400        # samples kept after the last speech sample before the fade-out (100 ms)
@@ -78,9 +78,11 @@ class Player:
         self.stream = None
         self.stream_lock = threading.Lock()   # guards open/close only; the callback never takes it
         self.idle_since = None   # when the last reply ended, while the stream is still open
+        self.last_cb = 0.0       # when the device last asked for audio; a stalled stream stops asking
         self.first = None        # when the first audio of this reply was queued (for the debug log)
 
     def _callback(self, outdata, frames, _time, _status):
+        self.last_cb = time.time()
         out = outdata[:, 0]
         filled = 0
         with self.lock:
@@ -101,7 +103,18 @@ class Player:
         with self.stream_lock:
             self.idle_since = None
             if self.stream is not None:
-                return   # still open from the last reply: no start-up pop
+                if self.stream.active:
+                    return   # still open from the last reply: no start-up pop
+                self._close_locked()   # a stream that stopped by itself (sleep, device gone): start a new one
+            # PortAudio lists the audio devices once, when it initialises. In a daemon that runs for hours the
+            # list goes stale when a device appears or disappears (2026-11-24: the speakers' index moved and
+            # speech went to the wrong device, silently). Re-initialise before every new stream so the
+            # default output is the one macOS has now.
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
             # Fixed 1024-sample blocks (43 ms): with latency="low" on a 48 kHz device PortAudio pulled this
             # 24 kHz stream in 15-sample callbacks, 1600 a second, and while MLX generated some arrived late,
             # which came out of the speakers as crackle. The first sound starts about 40 ms later for it.
@@ -131,21 +144,37 @@ class Player:
     def close(self):
         # The reply is over, but the stream stays open playing silence: opening and closing a CoreAudio
         # stream makes the speakers pop, which was heard as a crackle at the start and end of every reply.
-        # idle_close() shuts it after STREAM_IDLE seconds of silence, so a changed default output device
-        # (headphones plugged in) is picked up by the next reply after a pause.
+        # idle_close() shuts it after STREAM_IDLE seconds of silence (45 s: long enough to cover a
+        # conversation's turns, short enough that a changed output device is picked up at the next reply).
         with self.stream_lock:
             self.idle_since = time.time()
+
+    def _close_locked(self):
+        s, self.stream, self.idle_since = self.stream, None, None
+        if s is not None:
+            try:
+                s.stop()
+                s.close()
+            except Exception:
+                pass
 
     def idle_close(self):
         with self.stream_lock:
             if self.stream is None or self.idle_since is None or time.time() - self.idle_since < STREAM_IDLE:
                 return
-            s, self.stream, self.idle_since = self.stream, None, None
-        try:
-            s.stop()
-            s.close()
-        except Exception:
-            pass
+            self._close_locked()
+
+    def reopen(self):
+        """The device stopped asking for audio (after sleep, or the output device changed under a stream kept
+        open): start a fresh stream. The queued audio stays in the buffer and plays on the new stream."""
+        with self.stream_lock:
+            self._close_locked()
+        self.open()
+
+    def stalled(self, since):
+        """True when the device has not asked for audio since `since` (2026-11-24: after an overnight sleep the
+        kept-open stream went silent, the daemon thought it had spoken, and nothing came out)."""
+        return self.last_cb < since
 
 
 class Stretcher:
@@ -295,7 +324,12 @@ def speak(model, gen, text, voice, speed):
                     n = min(FADE, len(a))
                     a[:n] *= (0.5 - 0.5 * np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
                     onset = False
+                    t_push = time.time()
                     player.push(a)   # the first piece plays the moment it exists
+                    while time.time() - t_push < 1.5 and player.stalled(t_push):
+                        time.sleep(0.05)
+                    if player.stalled(t_push):
+                        player.reopen()   # dead stream: the piece is still queued and plays on the new one
                     continue
                 held = np.concatenate([held, a])
                 if len(held) > HOLD:
